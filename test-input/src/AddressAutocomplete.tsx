@@ -47,16 +47,49 @@ export default function AddressAutocomplete({
   // Helper: extract street and number from user input (e.g. "Okinawa 1518, Ze" -> { street: 'Okinawa', number: '1518' })
   const extractStreetAndNumber = (input: string): { street: string; number: string | null } => {
     const withoutCommas = input.split(',')[0].trim();
-    // Match last numeric token (allows letters after number like 1518A)
-    const match = withoutCommas.match(/^(.*?)(\b\d+[A-Za-z0-9\-\/]*)$/);
-    if (match) {
-      const street = match[1].trim();
-      const number = match[2].trim();
-      if (street && number) {
-        return { street, number };
+
+    // Split into tokens
+    const tokens = withoutCommas.split(/\s+/);
+
+    // Find all numeric tokens (including alphanumeric like "1518A")
+    const numericTokenIndices: number[] = [];
+    tokens.forEach((token, idx) => {
+      if (/^\d+[A-Za-z0-9\-\/]*$/.test(token)) {
+        numericTokenIndices.push(idx);
       }
+    });
+
+    // Case 1: Two or more numeric tokens -> assume last one is house number, rest are part of street
+    if (numericTokenIndices.length >= 2) {
+      const houseNumberIdx = numericTokenIndices[numericTokenIndices.length - 1];
+      const streetTokens = tokens.slice(0, houseNumberIdx);
+      const houseNumber = tokens[houseNumberIdx];
+
+      return {
+        street: streetTokens.join(' ').trim(),
+        number: houseNumber
+      };
     }
-    return { street: withoutCommas.replace(/\d+.*/, '').trim(), number: null };
+
+    // Case 2: One numeric token -> use old logic (last number is house number)
+    if (numericTokenIndices.length === 1) {
+      const numIdx = numericTokenIndices[0];
+      // If number is at the end, it's a house number
+      if (numIdx === tokens.length - 1 && numIdx > 0) {
+        return {
+          street: tokens.slice(0, numIdx).join(' ').trim(),
+          number: tokens[numIdx]
+        };
+      }
+      // If number is at beginning/middle, it's part of street name (e.g., "street 28")
+      return {
+        street: withoutCommas,
+        number: null
+      };
+    }
+
+    // Case 3: No numeric tokens
+    return { street: withoutCommas, number: null };
   };
 
   // Format address in Argentinian style, optionally injecting a user provided number
@@ -74,22 +107,24 @@ export default function AddressAutocomplete({
     const state = addr.state || '';
 
     let number = addr.house_number || '';
+    let streetToUse = streetOSM;
 
-    // If user typed a number and street matches (loosely) override / inject it
+    // If user typed a number, ALWAYS inject it (even if street names don't match)
+    // This is because local names (e.g., "Calle 844") often differ from official names (e.g., "Av. José Andrés López")
     if (injected?.number) {
-      const userStreetLc = injected.street.toLowerCase();
-      const osmStreetLc = streetOSM.toLowerCase();
-      if (userStreetLc && osmStreetLc && (osmStreetLc.includes(userStreetLc) || userStreetLc.includes(osmStreetLc))) {
-        number = injected.number; // force user number
-      }
+      number = injected.number;
+    }
+
+    // If user provided a street name, use it instead of OSM's official name
+    // This preserves local street names that users are familiar with
+    if (injected?.street) {
+      streetToUse = injected.street;
     }
 
     // Build pieces ensuring street always followed by number if number exists
     const parts: string[] = [];
-    if (streetOSM) {
-      parts.push(number ? `${streetOSM} ${number}` : streetOSM);
-    } else if (injected?.street) {
-      parts.push(injected.number ? `${injected.street} ${injected.number}` : injected.street);
+    if (streetToUse) {
+      parts.push(number ? `${streetToUse} ${number}` : streetToUse);
     }
     if (locality) parts.push(locality);
     if (municipality) parts.push(municipality);
@@ -120,8 +155,19 @@ export default function AddressAutocomplete({
       if (response.ok) {
         const results: NominatimResult[] = await response.json();
 
+        // Filter out results that don't have a street/road (they're just generic locations)
+        const validResults = results.filter(r => r.address?.road);
+
+        // If no valid streets found, don't show any suggestions
+        if (validResults.length === 0) {
+          setSuggestions([]);
+          setShowSuggestions(false);
+          setIsLoading(false);
+          return;
+        }
+
         // Map + inject user number if present
-        let mapped: NominatimResult[] = results.map(r => ({
+        let mapped: NominatimResult[] = validResults.map(r => ({
           ...r,
           display_name: formatArgentinianAddress(r, parsed)
         }));
@@ -132,7 +178,7 @@ export default function AddressAutocomplete({
 
           // If filtering removed all, synthesize suggestions from original results
           if (mapped.length === 0) {
-            mapped = results.map(r => ({
+            mapped = validResults.map(r => ({
               ...r,
               display_name: formatArgentinianAddress(r, parsed)
             }));
